@@ -611,3 +611,42 @@ func (s *ConsulCatalogSuite) TestConsulServiceWithHealthCheck(c *check.C) {
 	err = s.deregisterService("whoami2", false)
 	c.Assert(err, checker.IsNil)
 }
+
+func (s *ConsulCatalogSuite) TestBlockingConfiguration(c *check.C) {
+	tempObjects := struct {
+		ConsulAddress string
+		DefaultRule   string
+	}{
+		ConsulAddress: s.consulAddress,
+		DefaultRule:   "Host(`{{ normalize .Name }}.consul.localhost`)",
+	}
+
+	file := s.adaptFile(c, "fixtures/consul_catalog/blocking.toml", tempObjects)
+	defer os.Remove(file)
+
+	reg := &api.AgentServiceRegistration{
+		ID:      "whoami1",
+		Name:    "whoami",
+		Tags:    []string{"traefik.enable=true"},
+		Port:    80,
+		Address: s.composeProject.Container(c, "whoami1").NetworkSettings.IPAddress,
+	}
+	err := s.registerService(reg, false)
+	c.Assert(err, checker.IsNil)
+
+	cmd, display := s.traefikCmd(withConfigFile(file))
+	defer display(c)
+	err = cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer s.killCmd(cmd)
+
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/", nil)
+	c.Assert(err, checker.IsNil)
+	req.Host = "whoami.consul.localhost"
+
+	err = try.Request(req, 2*time.Second, try.StatusCodeIs(200), try.BodyContainsOr("Hostname: whoami1"))
+	c.Assert(err, checker.IsNil)
+
+	err = s.deregisterService("whoami1", false)
+	c.Assert(err, checker.IsNil)
+}
