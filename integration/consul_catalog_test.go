@@ -624,29 +624,42 @@ func (s *ConsulCatalogSuite) TestBlockingConfiguration(c *check.C) {
 	file := s.adaptFile(c, "fixtures/consul_catalog/blocking.toml", tempObjects)
 	defer os.Remove(file)
 
-	reg := &api.AgentServiceRegistration{
-		ID:      "whoami1",
-		Name:    "whoami",
-		Tags:    []string{"traefik.enable=true"},
-		Port:    80,
-		Address: s.composeProject.Container(c, "whoami1").NetworkSettings.IPAddress,
-	}
-	err := s.registerService(reg, false)
-	c.Assert(err, checker.IsNil)
-
 	cmd, display := s.traefikCmd(withConfigFile(file))
 	defer display(c)
-	err = cmd.Start()
+
+	err := cmd.Start()
 	c.Assert(err, checker.IsNil)
 	defer s.killCmd(cmd)
 
-	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/", nil)
-	c.Assert(err, checker.IsNil)
-	req.Host = "whoami.consul.localhost"
-
-	err = try.Request(req, 2*time.Second, try.StatusCodeIs(200), try.BodyContainsOr("Hostname: whoami1"))
+	// Checking Treafik is up (via its API)
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/version", nil)
 	c.Assert(err, checker.IsNil)
 
-	err = s.deregisterService("whoami1", false)
+	err = try.Request(req, 2*time.Second, try.StatusCodeIs(200), try.BodyContainsOr("Codename"))
 	c.Assert(err, checker.IsNil)
+
+	// Register and deregister the services at a fast pace.
+	for i := 1; i <= 3; i++ {
+		service := fmt.Sprintf("whoami%d", i)
+		reg := &api.AgentServiceRegistration{
+			ID:      service,
+			Name:    "whoami",
+			Tags:    []string{"traefik.enable=true"},
+			Port:    80,
+			Address: s.composeProject.Container(c, service).NetworkSettings.IPAddress,
+		}
+		err := s.registerService(reg, false)
+		c.Assert(err, checker.IsNil)
+
+		// This request should hit *after* the catalog has been refreshed.
+		req, err = http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/", nil)
+		c.Assert(err, checker.IsNil)
+		req.Host = "whoami.consul.localhost"
+
+		err = try.Request(req, time.Second, try.StatusCodeIs(200), try.BodyContainsOr(fmt.Sprintf("Hostname: %s", service)))
+		c.Assert(err, checker.IsNil)
+
+		err = s.deregisterService(service, false)
+		c.Assert(err, checker.IsNil)
+	}
 }
