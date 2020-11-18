@@ -85,6 +85,7 @@ func (p *Provider) SetDefaults() {
 	p.RefreshInterval = ptypes.Duration(15 * time.Second)
 	p.Prefix = "traefik"
 	p.ExposedByDefault = true
+	p.StrictChecks = true
 	p.DefaultRule = DefaultTemplateRule
 }
 
@@ -113,28 +114,23 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 				return fmt.Errorf("unable to create consul client: %w", err)
 			}
 
-			// get configuration at the provider's startup.
-			err = p.loadConfiguration(routineCtx, configurationChan)
+			// Fetch initial configuration at the startup of the provider.
+			data, lastIndex, err := p.getConsulServicesData(routineCtx)
 			if err != nil {
 				return fmt.Errorf("failed to get consul catalog data: %w", err)
 			}
 
-			// Periodic refreshes.
-			ticker := time.NewTicker(time.Duration(p.RefreshInterval))
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ticker.C:
-					err = p.loadConfiguration(routineCtx, configurationChan)
-					if err != nil {
-						return fmt.Errorf("failed to refresh consul catalog data: %w", err)
-					}
-
-				case <-routineCtx.Done():
-					return nil
-				}
+			configurationChan <- dynamic.Message{
+				ProviderName:  "consulcatalog",
+				Configuration: p.buildConfiguration(routineCtx, data),
 			}
+
+			// Pick the refresh strategy based on the configuration
+			if p.WaitTime > 0 {
+				return p.watch(routineCtx, data, lastIndex, configurationChan)
+			}
+
+			return p.poll(routineCtx, configurationChan)
 		}
 
 		notify := func(err error, time time.Duration) {
@@ -150,31 +146,50 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 	return nil
 }
 
-func (p *Provider) loadConfiguration(ctx context.Context, configurationChan chan<- dynamic.Message) error {
-	data, err := p.getConsulServicesData(ctx)
-	if err != nil {
-		return err
-	}
+// poll refreshes the Consul Catalog at each RefreshInterval.
+//
+// It is easier on the Consul Server if the catalog receives frequent updates.
+func (p *Provider) poll(ctx context.Context, configurationChan chan<- dynamic.Message) error {
+	// Periodic refreshes.
+	ticker := time.NewTicker(time.Duration(p.RefreshInterval))
+	defer ticker.Stop()
 
-	configurationChan <- dynamic.Message{
-		ProviderName:  "consulcatalog",
-		Configuration: p.buildConfiguration(ctx, data),
-	}
+	for {
+		select {
+		case <-ticker.C:
+			data, _, err := p.getConsulServicesData(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to refresh consul catalog data: %w", err)
+			}
 
-	return nil
+			configurationChan <- dynamic.Message{
+				ProviderName:  "consulcatalog",
+				Configuration: p.buildConfiguration(ctx, data),
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
 
-func (p *Provider) getConsulServicesData(ctx context.Context) ([]itemData, error) {
-	consulServiceNames, err := p.fetchServices(ctx)
+// watch maintains open connections on Consul.
+//
+// See: https://www.consul.io/api-docs/features/blocking
+func (p *Provider) watch(ctx context.Context, initialConfiguration []itemData, waitIndex uint64, configurationChan chan<- dynamic.Message) error {
+	return fmt.Errorf("not implemented error")
+}
+
+func (p *Provider) getConsulServicesData(ctx context.Context) ([]itemData, uint64, error) {
+	consulServiceNames, lastIndex, err := p.fetchServices(ctx, 0)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var data []itemData
 	for _, name := range consulServiceNames {
 		consulServices, healthServices, err := p.fetchService(ctx, name)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		for i, consulService := range consulServices {
@@ -204,7 +219,7 @@ func (p *Provider) getConsulServicesData(ctx context.Context) ([]itemData, error
 			data = append(data, item)
 		}
 	}
-	return data, nil
+	return data, lastIndex, nil
 }
 
 func (p *Provider) fetchService(ctx context.Context, name string) ([]*api.CatalogService, []*api.ServiceEntry, error) {
@@ -224,13 +239,18 @@ func (p *Provider) fetchService(ctx context.Context, name string) ([]*api.Catalo
 	return consulServices, healthServices, err
 }
 
-func (p *Provider) fetchServices(ctx context.Context) ([]string, error) {
+func (p *Provider) fetchServices(ctx context.Context, waitIndex uint64) ([]string, uint64, error) {
 	// The query option "Filter" is not supported by /catalog/services.
 	// https://www.consul.io/api/catalog.html#list-services
-	opts := &api.QueryOptions{AllowStale: p.Stale, RequireConsistent: p.RequireConsistent, UseCache: p.Cache}
-	serviceNames, _, err := p.client.Catalog().Services(opts)
+	opts := &api.QueryOptions{
+		AllowStale:        p.Stale,
+		RequireConsistent: p.RequireConsistent,
+		UseCache:          p.Cache,
+		WaitIndex:         waitIndex,
+	}
+	serviceNames, meta, err := p.client.Catalog().Services(opts)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// The keys are the service names, and the array values provide all known tags for a given service.
@@ -263,7 +283,7 @@ func (p *Provider) fetchServices(ctx context.Context) ([]string, error) {
 		filtered = append(filtered, svcName)
 	}
 
-	return filtered, err
+	return filtered, meta.LastIndex, err
 }
 
 func contains(values []string, val string) bool {
